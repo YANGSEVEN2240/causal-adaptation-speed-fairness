@@ -20,11 +20,3 @@ To get adaptation results run
 python main.py normal adaptation
 python main.py normal plot
 ```
-
-
-### Fairness (NEW)
-
-To get fairness-aware adaptation plots with sensitive variable A run
-```
-python main.py fairness adaptation
-python main.py fairness plot
