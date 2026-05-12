@@ -2,12 +2,13 @@ import argparse
 
 import categorical
 from categorical import plot_sweep, script_experiments
-from normal_pkg import adaptation, distances, plot_adaptation, plot_distances
+# from normal_pkg import adaptation, distances, plot_adaptation, plot_distances
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Evaluate the speed of adpatation of cause-effect models.')
-    parser.add_argument('distribution', type=str, choices=['categorical', 'normal'])
+    # parser.add_argument('distribution', type=str, choices=['categorical', 'normal'])
+    parser.add_argument('distribution', type=str, choices=['categorical', 'fairness', 'normal'])
     parser.add_argument('action', type=str, choices=['distance', 'adaptation', 'plot'])
 
     args = parser.parse_args()
@@ -28,6 +29,20 @@ if __name__ == "__main__":
         elif args.action == 'plot':
             for dense in [True, False]:
                 categorical.plot_sweep.all_plot(dense=dense, input_dir=results_dir)
+
+    elif args.distribution == 'fairness':
+        results_dir = 'fairness_results'
+        if args.action == 'adaptation':
+            print("Running fairness experiments")
+            for init_dense in [True, False]:
+                for intervention in ['A', 'X', 'AX', 'Y']:
+                    script_experiments.fairness_parameter_sweep(
+                        intervention, 5, 5, 5, init_dense, savedir=results_dir)
+        elif args.action == 'plot':
+            print("Plotting fairness results")
+            from categorical import plot_sweep
+            for dense in [True, False]:
+                plot_sweep.fairness_all_plot(dense=dense, input_dir=results_dir)
 
     elif args.distribution == 'normal':
         results_dir = 'normal_results'

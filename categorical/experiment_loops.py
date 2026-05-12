@@ -6,7 +6,79 @@ import tqdm
 from torch import optim
 
 from averaging_manager import AveragedModel
-from categorical.models import CategoricalModule, Counter, JointMAP, JointModule, sample_joint
+from categorical.models import (
+    CategoricalModule, Counter, JointMAP, JointModule, sample_joint,
+    FairnessCausalModule, FairnessAntiCausalModule, sample_fairness_joint
+)
+
+
+def experiment_optimize_fairness(k_a, k_x, k_y, n, T, lr, intervention,
+                                 concentration=1, is_init_dense=False,
+                                 batch_size=10, scheduler_exponent=0,
+                                 log_interval=10):
+
+    causalstatic = sample_fairness_joint(k_a, k_x, k_y, n, concentration, is_init_dense)
+    transferstatic = causalstatic.intervention(
+        on=intervention,
+        concentration=concentration,
+        dense=is_init_dense
+    )
+
+    # MODULES
+    causal = causalstatic.to_module()
+    transfer = transferstatic.to_module()
+    anticausal = causalstatic.reverse().to_module()
+    antitransfer = transferstatic.reverse().to_module()
+
+    # Optimizers
+    optkwargs = {'lr': lr, 'lambd': 0, 'alpha': 0, 't0': 0, 'weight_decay': 0}
+    causaloptimizer = optim.ASGD(causal.parameters(), **optkwargs)
+    antioptimizer = optim.ASGD(anticausal.parameters(), **optkwargs)
+    optimizers = [causaloptimizer, antioptimizer]
+
+    steps = []
+    ans = defaultdict(list)
+    for t in tqdm.tqdm(range(T)):
+        # EVALUATION
+        if t % log_interval == 0:
+            steps.append(t)
+            with torch.no_grad():
+                for model, optimizer, target, name in zip(
+                        [causal, anticausal],
+                        optimizers,
+                        [transfer, antitransfer],
+                        ['causal', 'anti']
+                ):
+                    # SGD
+                    ans[f'kl_{name}'].append(target.kullback_leibler(model))
+                    ans[f'scoredist_{name}'].append(target.scoredist(model))
+
+                    # ASGD
+                    with AveragedModel(model, optimizer) as m:
+                        ans[f'kl_{name}_average'].append(target.kullback_leibler(m))
+                        ans[f'scoredist_{name}_average'].append(target.scoredist(m))
+
+        # UPDATE
+        for opt in optimizers:
+            opt.lr = lr / max(t, 1) ** scheduler_exponent
+            opt.zero_grad()
+
+        if batch_size == 'full':
+            causalloss = transfer.kullback_leibler(causal).sum()
+            antiloss = antitransfer.kullback_leibler(anticausal).sum()
+        else:
+            aa, xx, yy = transferstatic.sample(m=batch_size, return_tensor=True)
+            causalloss = - causal(aa, xx, yy).sum() / batch_size
+            antiloss = - anticausal(aa, xx, yy).sum() / batch_size
+
+        for loss, opt in zip([causalloss, antiloss], optimizers):
+            loss.backward()
+            opt.step()
+
+    for key, item in ans.items():
+        ans[key] = torch.stack(item).numpy()
+
+    return {'steps': np.array(steps), **ans}
 
 
 def experiment_optimize(k, n, T, lr, intervention,
@@ -88,7 +160,7 @@ def experiment_optimize(k, n, T, lr, intervention,
 
         # UPDATE
         for opt in optimizers:
-            opt.lr = lr / t ** scheduler_exponent
+            opt.lr = lr / max(t, 1) ** scheduler_exponent
             opt.zero_grad()
 
         if batch_size == 'full':
@@ -194,7 +266,7 @@ def experiment_guess(
                         ans[f'scoredist_{name}_average'].append(target.scoredist(model))
 
         # UPDATE
-        optimizer.lr = lr / step ** scheduler_exponent
+        optimizer.lr = lr / max(step, 1) ** scheduler_exponent
         optimizer.zero_grad()
 
         if batch_size == 'full':

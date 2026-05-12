@@ -48,6 +48,36 @@ def sample_joint(k, n, concentration=1, dense=False, logits=True):
         return CategoricalStatic(pa, pba, from_probas=True)
 
 
+def sample_fairness_joint(k_a, k_x, k_y, n, concentration=1, dense=False, logits=True):
+    """Sample n causal mechanisms for three variables (A, X, Y)."""
+    if logits:
+        s_a = stats.loggamma.rvs(concentration, size=(n, k_a))
+        s_a -= s_a.mean(axis=1, keepdims=True)
+
+        cond_conc_x = concentration if dense else concentration / k_x
+        if cond_conc_x > 0.1:
+            s_x_given_a = stats.loggamma.rvs(cond_conc_x, size=(n, k_a, k_x))
+        else:
+            s_x_given_a = -stats.expon.rvs(scale=1 / cond_conc_x, size=(n, k_a, k_x))
+        s_x_given_a -= s_x_given_a.mean(axis=2, keepdims=True)
+
+        cond_conc_y = concentration if dense else concentration / k_y
+        if cond_conc_y > 0.1:
+            s_y_given_ax = stats.loggamma.rvs(cond_conc_y, size=(n, k_a, k_x, k_y))
+        else:
+            s_y_given_ax = -stats.expon.rvs(scale=1 / cond_conc_y, size=(n, k_a, k_x, k_y))
+        s_y_given_ax -= s_y_given_ax.mean(axis=3, keepdims=True)
+
+        return FairnessCategoricalStatic(s_a, s_x_given_a, s_y_given_ax, from_probas=False)
+    else:
+        p_a = np.random.dirichlet(concentration * np.ones(k_a), size=n)
+        cond_conc_x = concentration if dense else concentration / k_x
+        p_x_given_a = np.random.dirichlet(cond_conc_x * np.ones(k_x), size=[n, k_a])
+        cond_conc_y = concentration if dense else concentration / k_y
+        p_y_given_ax = np.random.dirichlet(cond_conc_y * np.ones(k_y), size=[n, k_a, k_x])
+        return FairnessCategoricalStatic(p_a, p_x_given_a, p_y_given_ax, from_probas=True)
+
+
 class CategoricalStatic:
     """Represent n categorical distributions of variables (a,b) of dimension k each."""
 
@@ -231,11 +261,11 @@ class CategoricalModule(nn.Module):
         if self.BtoA:
             a, b = b, a
         rows = torch.arange(0, self.n).unsqueeze(1).repeat(1, batch_size)
-        return self.to_joint()[rows.view(-1), a.view(-1), b.view(-1)].view(self.n, batch_size)
+        return self.to_joint()[rows.view(-1), a.view(-1).long(), b.view(-1).long()].view(self.n, batch_size)
 
     def to_joint(self):
         return F.log_softmax(self.sba, dim=2) \
-               + F.log_softmax(self.sa, dim=1).unsqueeze(dim=2)
+            + F.log_softmax(self.sa, dim=1).unsqueeze(dim=2)
 
     def to_static(self):
         return CategoricalStatic(
@@ -250,7 +280,7 @@ class CategoricalModule(nn.Module):
 
     def scoredist(self, other):
         return torch.sum((self.sa - other.sa) ** 2, dim=1) \
-               + torch.sum((self.sba - other.sba) ** 2, dim=(1, 2))
+            + torch.sum((self.sba - other.sba) ** 2, dim=(1, 2))
 
     def __repr__(self):
         return f"CategoricalModule(joint={self.to_joint().detach()})"
@@ -302,7 +332,7 @@ class JointModule(nn.Module):
         batch_size = a.shape[1]
         rows = torch.arange(0, self.n).unsqueeze(1).repeat(1, batch_size).view(-1)
         index = (a * self.k + b).view(-1)
-        return F.log_softmax(self.logits, dim=1)[rows, index].view(self.n, batch_size)
+        return F.log_softmax(self.logits, dim=1)[rows.long(), index.long()].view(self.n, batch_size)
 
     def kullback_leibler(self, other):
         a = self.logpartition
@@ -353,6 +383,216 @@ class JointMAP:
 
     def to_joint(self):
         return np.log(self.frequencies)
+
+
+
+class FairnessCategoricalStatic:
+    """Three-variable distribution: P(A), P(X|A), P(Y|A,X)"""
+
+    def __init__(self, p_a, p_x_given_a, p_y_given_ax, from_probas=True, is_anticausal=False):
+        self.n = p_a.shape[0]
+        self.k_a = p_a.shape[1]
+        self.k_x = p_x_given_a.shape[2]
+        self.k_y = p_y_given_ax.shape[3]
+        self.is_anticausal = is_anticausal
+
+        if from_probas:
+            self.p_a, self.p_x_given_a, self.p_y_given_ax = p_a, p_x_given_a, p_y_given_ax
+            self.s_a = proba2logit(p_a)
+            self.s_x_given_a = proba2logit(p_x_given_a)
+            self.s_y_given_ax = proba2logit(p_y_given_ax)
+        else:
+            self.s_a, self.s_x_given_a, self.s_y_given_ax = p_a, p_x_given_a, p_y_given_ax
+            self.p_a = logit2proba(p_a)
+            self.p_x_given_a = logit2proba(p_x_given_a)
+            self.p_y_given_ax = logit2proba(p_y_given_ax)
+
+    def to_joint(self, return_probas=True):
+        if return_probas:
+            return (self.p_a[:, :, None, None] *
+                    self.p_x_given_a[:, :, :, None] *
+                    self.p_y_given_ax)
+        else:
+            joint = (self.s_a[:, :, None, None] +
+                     self.s_x_given_a[:, :, :, None] +
+                     self.s_y_given_ax)
+            return joint - joint.mean(axis=(1, 2, 3), keepdims=True)
+
+    def reverse(self):
+        # 基于概率计算反方向条件分布，避免 logits 均值减法导致的偏差
+        joint = self.to_joint(return_probas=True)  # [n, k_a, k_x, k_y]
+
+        # p(a,y) = sum_x p(a,x,y)
+        p_ay = np.sum(joint, axis=2)  # [n, k_a, k_y]
+        p_y_given_a = p_ay / np.sum(p_ay, axis=2, keepdims=True)  # [n, k_a, k_y]
+
+        # p(x|a,y) = p(a,x,y) / p(a,y)
+        p_x_given_ay = joint / p_ay[:, :, None, :]  # [n, k_a, k_x, k_y]
+        # 转置为 [n, k_a, k_y, k_x] 以匹配 FairnessAntiCausalModule
+        p_x_given_ay = p_x_given_ay.transpose(0, 1, 3, 2)  # [n, k_a, k_y, k_x]
+
+        # 转回 logits
+        s_y_given_a = proba2logit(p_y_given_a)
+        s_x_given_ay = proba2logit(p_x_given_ay)
+
+        return FairnessCategoricalStatic(
+            self.s_a, s_y_given_a, s_x_given_ay,
+            from_probas=False, is_anticausal=True
+        )
+
+    def scoredist(self, other):
+        dist = np.sum((self.s_a - other.s_a) ** 2, axis=1)
+        dist += np.sum((self.s_x_given_a - other.s_x_given_a) ** 2, axis=(1, 2))
+        dist += np.sum((self.s_y_given_ax - other.s_y_given_ax) ** 2, axis=(1, 2, 3))
+        return dist
+
+    def kullback_leibler(self, other):
+        p0 = self.to_joint().reshape(self.n, -1)
+        p1 = other.to_joint().reshape(other.n, -1)
+        return kullback_leibler(p0, p1)
+
+    def intervention(self, on, concentration=1, dense=True):
+        if on == 'A':
+            new_p_a = np.random.dirichlet(concentration * np.ones(self.k_a), size=self.n)
+            return FairnessCategoricalStatic(new_p_a, self.p_x_given_a, self.p_y_given_ax,
+                                             is_anticausal=self.is_anticausal)
+        elif on == 'X':
+            new_p_x = np.random.dirichlet(concentration * np.ones(self.k_x), size=self.n)
+            new_p_x_given_a = np.repeat(new_p_x[:, None, :], self.k_a, axis=1)
+            return FairnessCategoricalStatic(self.p_a, new_p_x_given_a, self.p_y_given_ax,
+                                             is_anticausal=self.is_anticausal)
+        elif on == 'AX':
+            new_p_a = np.random.dirichlet(concentration * np.ones(self.k_a), size=self.n)
+            new_p_x = np.random.dirichlet(concentration * np.ones(self.k_x), size=self.n)
+            new_p_x_given_a = np.repeat(new_p_x[:, None, :], self.k_a, axis=1)
+            return FairnessCategoricalStatic(new_p_a, new_p_x_given_a, self.p_y_given_ax,
+                                             is_anticausal=self.is_anticausal)
+        elif on == 'Y':
+            # 采样新的边际分布 p*(y)，独立于 A 和 X
+            new_s_y = stats.loggamma.rvs(concentration, size=(self.n, self.k_y))
+            new_s_y -= new_s_y.mean(axis=1, keepdims=True)
+            # 扩展为 [n, k_a, k_x, k_y]，对所有 a,x 相同
+            new_s_y_given_ax = np.repeat(
+                np.repeat(new_s_y[:, None, None, :], self.k_a, axis=1),
+                self.k_x, axis=2
+            )
+            return FairnessCategoricalStatic(
+                self.s_a, self.s_x_given_a, new_s_y_given_ax,
+                from_probas=False, is_anticausal=self.is_anticausal
+            )
+        else:
+            raise ValueError(f'Intervention on {on} not supported.')
+
+    def sample(self, m, return_tensor=False):
+        flat_joint = self.to_joint().reshape((self.n, -1))
+        total = self.k_a * self.k_x * self.k_y
+        samples = np.array([np.random.choice(total, size=m, p=p) for p in flat_joint])
+        a = samples // (self.k_x * self.k_y)
+        remainder = samples % (self.k_x * self.k_y)
+        x = remainder // self.k_y
+        y = remainder % self.k_y
+        if not return_tensor:
+            return a, x, y
+        else:
+            return torch.from_numpy(a), torch.from_numpy(x), torch.from_numpy(y)
+
+    def to_module(self):
+        if self.is_anticausal:
+            return FairnessAntiCausalModule(self.s_a, self.s_x_given_a, self.s_y_given_ax, is_btoa=True)
+        else:
+            return FairnessCausalModule(self.s_a, self.s_x_given_a, self.s_y_given_ax, is_btoa=False)
+
+class FairnessCausalModule(nn.Module):
+    """Causal: P(A) * P(X|A) * P(Y|A,X)"""
+
+    def __init__(self, s_a, s_x_given_a, s_y_given_ax, is_btoa=False):
+        super(FairnessCausalModule, self).__init__()
+        self.n, self.k_a = s_a.shape
+        self.k_x = s_x_given_a.shape[2]
+        self.k_y = s_y_given_ax.shape[3]
+        self.BtoA = is_btoa
+        self.s_a = nn.Parameter(torch.FloatTensor(s_a))
+        self.s_x_given_a = nn.Parameter(torch.FloatTensor(s_x_given_a))
+        self.s_y_given_ax = nn.Parameter(torch.FloatTensor(s_y_given_ax))
+
+    def to_joint(self):
+        return (self.s_a[:, :, None, None] +
+                self.s_x_given_a[:, :, :, None] +
+                self.s_y_given_ax)
+
+    def forward(self, a, x, y):
+        batch_size = a.shape[1]
+        rows = torch.arange(0, self.n).unsqueeze(1).repeat(1, batch_size)
+        log_p_a = F.log_softmax(self.s_a, dim=1)[rows.view(-1), a.view(-1).long()].view(self.n, batch_size)
+        log_p_x_a = F.log_softmax(self.s_x_given_a, dim=2)[
+            rows.view(-1), a.view(-1).long(), x.view(-1).long()
+        ].view(self.n, batch_size)
+        log_p_y_ax = F.log_softmax(self.s_y_given_ax, dim=3)[
+            rows.view(-1), a.view(-1).long(), x.view(-1).long(), y.view(-1).long()
+        ].view(self.n, batch_size)
+        return log_p_a + log_p_x_a + log_p_y_ax
+
+    def kullback_leibler(self, other):
+        joint = self.to_joint()
+        other_joint = other.to_joint()
+        log_joint = F.log_softmax(joint.reshape(self.n, -1), dim=1)
+        log_other = F.log_softmax(other_joint.reshape(self.n, -1), dim=1)
+        return torch.sum(torch.exp(log_joint) * (log_joint - log_other), dim=1)
+
+    # ... existing code ...
+
+    def scoredist(self, other):
+        dist = torch.sum((self.s_a - other.s_a) ** 2, dim=1)
+        dist += torch.sum((self.s_x_given_a - other.s_x_given_a) ** 2, dim=(1, 2))
+        dist += torch.sum((self.s_y_given_ax - other.s_y_given_ax) ** 2, dim=(1, 2, 3))
+        return dist
+
+
+class FairnessAntiCausalModule(nn.Module):
+    """Anticausal: P(A) * P(Y|A) * P(X|A,Y)"""
+
+    def __init__(self, s_a, s_y_given_a, s_x_given_ay, is_btoa=True):
+        super(FairnessAntiCausalModule, self).__init__()
+        self.n, self.k_a = s_a.shape
+        self.k_y = s_y_given_a.shape[2]
+        self.k_x = s_x_given_ay.shape[3]
+        self.BtoA = is_btoa
+        self.s_a = nn.Parameter(torch.FloatTensor(s_a))
+        self.s_y_given_a = nn.Parameter(torch.FloatTensor(s_y_given_a))
+        self.s_x_given_ay = nn.Parameter(torch.FloatTensor(s_x_given_ay))
+
+    def to_joint(self):
+        s_a_exp = self.s_a[:, :, None, None]
+        s_y_a_exp = self.s_y_given_a[:, :, None, :]
+        s_x_ay_trans = self.s_x_given_ay.permute(0, 1, 3, 2)
+        return s_a_exp + s_y_a_exp + s_x_ay_trans
+
+    def forward(self, a, x, y):
+        batch_size = a.shape[1]
+        rows = torch.arange(0, self.n).unsqueeze(1).repeat(1, batch_size)
+        log_p_a = F.log_softmax(self.s_a, dim=1)[rows.view(-1), a.view(-1).long()].view(self.n, batch_size)
+        log_p_y_a = F.log_softmax(self.s_y_given_a, dim=2)[
+            rows.view(-1), a.view(-1).long(), y.view(-1).long()
+        ].view(self.n, batch_size)
+        log_p_x_ay = F.log_softmax(self.s_x_given_ay, dim=3)[
+            rows.view(-1), a.view(-1).long(), y.view(-1).long(), x.view(-1).long()
+        ].view(self.n, batch_size)
+        return log_p_a + log_p_y_a + log_p_x_ay
+
+    def kullback_leibler(self, other):
+        joint = self.to_joint()
+        other_joint = other.to_joint()
+        log_joint = F.log_softmax(joint.reshape(self.n, -1), dim=1)
+        log_other = F.log_softmax(other_joint.reshape(self.n, -1), dim=1)
+        return torch.sum(torch.exp(log_joint) * (log_joint - log_other), dim=1)
+
+    # ... existing code ...
+
+    def scoredist(self, other):
+        dist = torch.sum((self.s_a - other.s_a) ** 2, dim=1)
+        dist += torch.sum((self.s_y_given_a - other.s_y_given_a) ** 2, dim=(1, 2))
+        dist += torch.sum((self.s_x_given_ay - other.s_x_given_ay) ** 2, dim=(1, 2, 3))
+        return dist
 
 
 if __name__ == "__main__":
